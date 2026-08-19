@@ -1,0 +1,32 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"$HOME/.acp/hooks/grok-build/hook.mjs\"", "timeout": 30 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"$HOME/.acp/hooks/grok-build/hook.mjs\"", "timeout": 30 }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"$HOME/.acp/hooks/grok-build/hook.mjs\"", "timeout": 30 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "node \"$HOME/.acp/hooks/grok-build/hook.mjs\"", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "name": "@agenticcontrolplane/grok-build",
+  "version": "0.1.0",
+  "description": "Agentic Control Plane governance hook for Grok Build (xAI) — identity, audit, and policy enforcement on every tool call, firing even in always-approve mode",
+  "type": "module",
+  "main": "hook.mjs",
+  "files": [
+    "hook.mjs",
+    "hooks/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "grok-build",
+    "xai",
+    "agent-governance",
+    "hooks",
+    "policy",
+    "audit",
+    "agentic-control-plane"
+  ],
+  "homepage": "https://agenticcontrolplane.com/controls/grok-build",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/agentic-control-plane/grok-build-acp-plugin.git"
+  },
+  "license": "MIT"
+}
