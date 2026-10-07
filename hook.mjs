@@ -25,13 +25,12 @@
  *     FAIL-OPEN by Grok's design. Our unattended fail-closed posture below
  *     therefore rides on the deny channel, not on erroring out.
  *
- * ASK MAPPING: Grok has no ask decision, so an ACP `ask` verdict resolves
- * by permission mode. In `default`/`plan` mode Grok's own permission gate
- * still stands between this hook and execution, so ask defers to the native
- * prompt (allow). In `auto`/`bypassPermissions`/headless modes nobody is in
- * the approval chair — ask becomes a deny that carries the console link.
- * Caveat (documented): an explicit local allow rule outranks an ACP ask in
- * interactive mode; ACP denies always hold.
+ * ASK MAPPING: Grok has no ask decision (docs.x.ai/build/features/hooks:
+ * "Only an explicit deny blocks"; exit 0 allows, exit 2 denies), and a hook
+ * allow does not reach the human — it only declines to deny, after which
+ * Grok's own gate auto-approves reads, searches and allow-listed shell
+ * commands. An ACP `ask` therefore fails CLOSED in every permission mode:
+ * deny, with the ACP reason and the console approval link. Never allow.
  *
  * Unreachability posture (gatewaystack-connect#385, never-brick): interactive
  * sessions fail OPEN with a loud UNGOVERNED warning and a ~/.acp/lapse.log
@@ -344,12 +343,15 @@ export async function decide(payload, env = process.env) {
   }
   if (data.decision === 'ask') {
     bump(call.sessionId, 'asked')
-    if (ATTENDED_MODES.has(call.permissionMode)) {
-      // A human answers prompts in this mode and Grok's own permission gate
-      // still stands after this hook — the ask lands on the native prompt.
-      return { out: ALLOW, warn: `[ACP] Approval required: ${data.reason ?? 'approval required'} — resolve at Grok's prompt.` }
-    }
-    const reason = `[ACP] Approval required: ${data.reason ?? 'approval required'} — nobody is at the prompt in ${call.permissionMode ?? 'this'} mode, so the call is held. Review it: ${(env.ACP_CONSOLE_BASE ?? config.console_base ?? 'https://cloud.agenticcontrolplane.com')}/activity`
+    // Grok has no ask decision and a hook "allow" only declines to deny: the
+    // call then falls through to Grok's own gate, which auto-approves reads,
+    // searches and allow-listed shell commands — so an allow here would turn
+    // a policy ask into a silent allow. Fail closed in every mode; the reason
+    // carries the ACP verdict and the place to approve it.
+    const where = ATTENDED_MODES.has(call.permissionMode)
+      ? 'Grok hooks cannot prompt, so the call is held'
+      : `nobody is at the prompt in ${call.permissionMode ?? 'this'} mode, so the call is held`
+    const reason = `[ACP] Approval required: ${data.reason ?? 'approval required'} — ${where}. Approve it: ${(env.ACP_CONSOLE_BASE ?? config.console_base ?? 'https://cloud.agenticcontrolplane.com')}/activity`
     return { out: encodeDeny(reason, call.event), deny: true }
   }
   if (data.warning) return { out: ALLOW, warn: String(data.warning) }
