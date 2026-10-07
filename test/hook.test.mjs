@@ -95,10 +95,23 @@ test('policy deny emits top-level decision:"deny" plus forward-compat hookSpecif
   assert.equal(out.hookSpecificOutput.permissionDecision, 'deny')
 })
 
-test('ask in default mode defers to the native prompt (allow + warning)', async () => {
-  const { out, warn } = await decide(grokPayload('git push origin main'), makeEnv())
-  assert.equal(out.decision, 'allow')
-  assert.match(warn, /Approval required/)
+test('ask in default mode fails closed: deny with the ACP reason (never a silent allow)', async () => {
+  const { out, deny, warn } = await decide(grokPayload('git push origin main'), makeEnv())
+  assert.equal(deny, true)
+  assert.equal(out.decision, 'deny')
+  assert.match(out.reason, /Approval required: outward-facing/)
+  assert.match(out.reason, /cloud\.agenticcontrolplane\.com/)
+  assert.equal(warn, undefined)
+})
+
+test('ask in plan mode also fails closed', async () => {
+  const { out, deny } = await decide(
+    grokPayload('git push origin main', { permissionMode: 'plan' }),
+    makeEnv(),
+  )
+  assert.equal(deny, true)
+  assert.equal(out.decision, 'deny')
+  assert.match(out.reason, /Approval required: outward-facing/)
 })
 
 test('ask in bypassPermissions mode becomes a deny with the console link', async () => {

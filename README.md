@@ -36,10 +36,9 @@ Credentials live at `~/.acp/credentials` (the installer provisions them; or past
 
 ## The ask decision
 
-Grok Build's hook contract has no `ask` — a gate hook can only allow or deny. An ACP `ask` verdict resolves by permission mode:
+Grok Build's hook contract has no `ask` — a gate hook can only deny or decline to deny ([docs](https://docs.x.ai/build/features/hooks): "Only an explicit `deny` blocks"; exit 0 allows, exit 2 denies). A hook allow does not reach the human: the call falls through to Grok's own permission gate, which auto-approves reads, searches and allow-listed shell commands. Letting an ACP `ask` through would therefore turn a policy ask into a silent allow.
 
-- **`default` / `plan`** — a human answers prompts and Grok's own permission gate still stands after this hook, so the ask lands on the native prompt. Caveat: an explicit local allow rule outranks an ACP ask in these modes. ACP denies always hold.
-- **`auto` / `bypassPermissions` / headless** — nobody is at the prompt: the ask becomes a deny whose reason carries the console link.
+So an ACP `ask` fails **closed in every permission mode** (`default`, `plan`, `auto`, `bypassPermissions`, headless): the call is denied with the ACP reason and the console link. Approve it on the dashboard and re-run, or set an allow rule for the tool. ACP denies always hold.
 
 ## Failure posture
 
@@ -71,7 +70,7 @@ Environment (or `~/.acp/config.json` — snake_case keys — for setups where en
 node --test test/*.test.mjs
 ```
 
-17 offline tests against a mock gateway (payload parsing both vocabularies, deny/ask/allow, both fail postures, retry discipline, tool-name mapping, receipts). Deny/allow/receipt additionally verified live against the production gateway on Grok's documented payload shape.
+18 offline tests against a mock gateway (payload parsing both vocabularies, deny/ask/allow, both fail postures, retry discipline, tool-name mapping, receipts). Deny/allow/receipt additionally verified live against the production gateway on Grok's documented payload shape.
 
 ## Which ACP?
 
