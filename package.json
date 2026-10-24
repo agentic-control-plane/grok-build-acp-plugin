@@ -1,6 +1,6 @@
 {
   "name": "@agenticcontrolplane/grok-build",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Agentic Control Plane governance hook for Grok Build (xAI) — identity, audit, and policy enforcement on every tool call, firing even in always-approve mode",
   "type": "module",
   "main": "hook.mjs",
