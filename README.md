@@ -2,7 +2,7 @@
 
 ![zero dependencies](https://img.shields.io/badge/dependencies-0-brightgreen) ![license](https://img.shields.io/badge/license-MIT-blue)
 
-[Agentic Control Plane](https://agenticcontrolplane.com) governance hook for **Grok Build** (xAI's coding agent). Every tool call is checked against your workspace policy before it runs — and because Grok Build fires `PreToolUse` hooks in **every** permission mode, the policy holds even in `--always-approve`.
+[Agentic Control Plane](https://agenticcontrolplane.com) governance hook for **Grok Build** (xAI's coding agent). Every tool call is checked against your workspace policy before it runs. Grok Build fires `PreToolUse` hooks in every permission mode, so the check also runs in `--always-approve`.
 
 Before any tool runs, ACP is consulted via `/govern/tool-use`; after it runs, the output goes to `/govern/tool-output` for audit and PII scan. Session end emits a receipt with a review link.
 
@@ -12,7 +12,7 @@ Before any tool runs, ACP is consulted via `/govern/tool-use`; after it runs, th
 curl -fsSL https://agenticcontrolplane.com/install.sh | bash
 ```
 
-The installer detects Grok Build, places the hook at `~/.acp/hooks/grok-build/hook.mjs`, and registers it in `~/.grok/hooks/acp.json` (user-global — no per-project trust prompt). Manual install:
+The installer detects Grok Build, places the hook at `~/.acp/hooks/grok-build/hook.mjs`, and registers it in `~/.grok/hooks/acp.json` (user-global, so there is no per-project trust prompt). Manual install:
 
 ```bash
 mkdir -p ~/.acp/hooks/grok-build ~/.grok/hooks
@@ -30,34 +30,34 @@ Credentials live at `~/.acp/credentials` (the installer provisions them; or past
 |---|---|---|
 | `PreToolUse` | `POST /govern/tool-use` | `deny` blocks the call (top-level `decision:"deny"` + exit 2, both channels); `ask` resolves by mode (below); `allow` proceeds |
 | `PostToolUse` / `PostToolUseFailure` | `POST /govern/tool-output` | Audit + PII scan; a post-hoc block degrades to a loud audit line (Grok's only blocking tool event is `PreToolUse`) |
-| `Stop` | — | Session receipt in the scrollback with a console review link |
+| `Stop` | none | Session receipt in the scrollback with a console review link |
 
-**Tool-name mapping.** Grok's native names (`run_terminal_command`, `read_file`, `search_replace`, …) are mapped to the canonical vocabulary before the policy check so content floors fire — verified live: `rm -rf /` hits the hardline floor under the native name. The native name is preserved as `client_tool_name` in the audit record. Unknown and MCP (`server__tool`) names pass through.
+**Tool-name mapping.** Grok's native names (`run_terminal_command`, `read_file`, `search_replace`, …) are mapped to the canonical vocabulary before the policy check so content floors fire. For example, `rm -rf /` hits the hardline floor under the native name. The native name is preserved as `client_tool_name` in the audit record. Unknown and MCP (`server__tool`) names pass through.
 
 ## The ask decision
 
-Grok Build's hook contract has no `ask` — a gate hook can only deny or decline to deny ([docs](https://docs.x.ai/build/features/hooks): "Only an explicit `deny` blocks"; exit 0 allows, exit 2 denies). A hook allow does not reach the human: the call falls through to Grok's own permission gate, which auto-approves reads, searches and allow-listed shell commands. Letting an ACP `ask` through would therefore turn a policy ask into a silent allow.
+Grok Build's hook contract has no `ask`. A gate hook can only deny or decline to deny ([docs](https://docs.x.ai/build/features/hooks): "Only an explicit `deny` blocks"; exit 0 allows, exit 2 denies). A hook allow does not reach the human: the call falls through to Grok's own permission gate, which auto-approves reads, searches and allow-listed shell commands. Letting an ACP `ask` through would therefore turn a policy ask into a silent allow.
 
-So an ACP `ask` fails **closed in every permission mode** (`default`, `plan`, `auto`, `bypassPermissions`, headless): the call is denied with the ACP reason and the console link. Approve it on the dashboard and re-run, or set an allow rule for the tool. ACP denies always hold.
+So an ACP `ask` fails **closed in every permission mode** (`default`, `plan`, `auto`, `bypassPermissions`, headless): the call is denied with the ACP reason and the console link (`hook.mjs`, `data.decision === 'ask'`). Approve it on the dashboard and re-run, or set an allow rule for the tool.
 
 ## Failure posture
 
-Grok Build hooks are **fail-open by design** — a timed-out, crashed, or malformed hook logs and allows. This hook therefore makes its posture explicit rather than inheriting Grok's:
+Grok Build hooks are **fail-open by design**: a timed-out, crashed, or malformed hook logs and allows. This hook sets its own posture instead of inheriting Grok's. If the gateway is unreachable:
 
-- **Interactive sessions** (`default`/`plan`/`auto`): gateway unreachable → fail **open**, loudly — `[ACP] ⚠ UNGOVERNED` on stderr and a durable line in `~/.acp/lapse.log`. An ACP outage must never brick your session.
-- **Unattended tiers** (`bypassPermissions`, headless, CI): fail **closed** — nobody is watching, so the block is the safety net.
-- One retry on transport failure before the posture applies (cold starts answer on the second try). HTTP error statuses are the server answering — never retried.
-- The registered hook timeout (30s) sits far above the internal 4s decision budget, so our posture decides the outcome, not Grok's fail-open timer.
+- **Interactive sessions** (`default`/`plan`/`auto`) fail **open**, loudly: `[ACP] ⚠ UNGOVERNED` on stderr and a durable line in `~/.acp/lapse.log`.
+- **Unattended tiers** (`bypassPermissions`, `dontAsk`, or `CI` set) fail **closed**. A headless run with none of those signals counts as interactive. Nobody is watching, so the block is the safety net.
+- There is one retry on transport failure before the posture applies (cold starts answer on the second try). HTTP error statuses are the server answering and are never retried.
+- The registered hook timeout (30s) sits far above the internal 4s decision budget, so this hook's posture decides the outcome, not Grok's fail-open timer.
 
-For yolo users: `--always-approve` bypasses Grok's own prompts but **not** this hook — Grok fires deny rules and PreToolUse hooks in every mode. That is the point.
+`--always-approve` bypasses Grok's own prompts but not this hook, because Grok fires deny rules and PreToolUse hooks in every mode.
 
 ## Configuration
 
-Environment (or `~/.acp/config.json` — snake_case keys — for setups where env doesn't reach hooks):
+Environment (or `~/.acp/config.json` with snake_case keys, for setups where env doesn't reach hooks):
 
 | Env | Config key | Default |
 |---|---|---|
-| `ACP_BEARER_TOKEN` | — | `~/.acp/credentials` |
+| `ACP_BEARER_TOKEN` | none | `~/.acp/credentials` |
 | `ACP_GOVERN_BASE` | `govern_base` | `https://govern.agenticcontrolplane.com` |
 | `ACP_CONSOLE_BASE` | `console_base` | `https://cloud.agenticcontrolplane.com` |
 | `ACP_AGENT_TIER` | `agent_tier` | resolved from `permissionMode` / CI |
@@ -70,11 +70,11 @@ Environment (or `~/.acp/config.json` — snake_case keys — for setups where en
 node --test test/*.test.mjs
 ```
 
-18 offline tests against a mock gateway (payload parsing both vocabularies, deny/ask/allow, both fail postures, retry discipline, tool-name mapping, receipts). Deny/allow/receipt additionally verified live against the production gateway on Grok's documented payload shape.
+Offline tests against a mock gateway cover payload parsing in both vocabularies, deny/ask/allow, both fail postures, retry behavior, tool-name mapping and receipts.
 
 ## Which ACP?
 
-This is the **Agentic Control Plane**. Grok Build also speaks Zed's **Agent Client Protocol** (`grok agent stdio`) — an editor-integration protocol that shares the acronym. [Disambiguation.](https://agenticcontrolplane.com/acp-vs-acp)
+This is the **Agentic Control Plane**. Grok Build also speaks Zed's **Agent Client Protocol** (`grok agent stdio`), an editor-integration protocol that shares the acronym. [Disambiguation.](https://agenticcontrolplane.com/acp-vs-acp)
 
 ## License
 
