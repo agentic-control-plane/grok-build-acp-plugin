@@ -45,7 +45,7 @@ So an ACP `ask` fails **closed in every permission mode** (`default`, `plan`, `a
 Grok Build hooks are **fail-open by design**: a timed-out, crashed, or malformed hook logs and allows. This hook sets its own posture instead of inheriting Grok's. If the gateway is unreachable:
 
 - **Interactive sessions** (`default`/`plan`/`auto`) fail **open**, loudly: `[ACP] ⚠ UNGOVERNED` on stderr and a durable line in `~/.acp/lapse.log`.
-- **Unattended tiers** (`bypassPermissions`, headless, CI) fail **closed**. Nobody is watching, so the block is the safety net.
+- **Unattended tiers** (`bypassPermissions`, `dontAsk`, or `CI` set) fail **closed**. A headless run with none of those signals counts as interactive. Nobody is watching, so the block is the safety net.
 - There is one retry on transport failure before the posture applies (cold starts answer on the second try). HTTP error statuses are the server answering and are never retried.
 - The registered hook timeout (30s) sits far above the internal 4s decision budget, so this hook's posture decides the outcome, not Grok's fail-open timer.
 
