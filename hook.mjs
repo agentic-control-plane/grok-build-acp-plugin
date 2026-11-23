@@ -10,14 +10,16 @@
  *   post_tool_use (+failure)  -> POST {ACP_GOVERN}/govern/tool-output
  *   stop                      -> session receipt (gatewaystack-connect#606)
  *
- * OUTPUT CONTRACT (verified in the open-source hook runner,
- * crates/codegen/xai-grok-hooks/src/runner/mod.rs, 2026-08-19):
- *   - PreToolUse gates parse ONLY the top-level `decision` field:
- *     "deny" (+ `reason`) blocks; "allow" or absent allows; any other value
- *     is an unknown-decision error. Claude's `hookSpecificOutput.
- *     permissionDecision` is NOT parsed (xAI's own example emits it for
- *     forward-compatibility only), and Claude's legacy "approve"/"block"
- *     values are unknown-decision errors. There is NO "ask" decision.
+ * OUTPUT CONTRACT (hook runner, crates/codegen/xai-grok-hooks/src/runner/
+ * mod.rs, verified 2026-08-19; ask per the Grok Build hooks docs and
+ * changelog, read 2026-11-22):
+ *   - PreToolUse gates read the top-level `decision`: "deny" (+ `reason`)
+ *     blocks; "allow" or absent allows. Since Grok Build 1.0.13 "ask" makes
+ *     Grok show its own confirmation prompt, naming the hook and showing the
+ *     reason; `hookSpecificOutput.permissionDecision`, when present, decides
+ *     and carries the message in `permissionDecisionReason`. We emit both.
+ *   - Before 1.0.13 "ask" is an unknown decision value, and an unknown value
+ *     FAILS OPEN — an ask sent to an old Grok would run the call.
  *   - Exit code 2 is an alternate deny channel (first stderr line becomes
  *     the reason); a stdout deny is honored regardless of exit code. We
  *     emit both on deny — belt and braces.
@@ -25,12 +27,17 @@
  *     FAIL-OPEN by Grok's design. Our unattended fail-closed posture below
  *     therefore rides on the deny channel, not on erroring out.
  *
- * ASK MAPPING: Grok has no ask decision (docs.x.ai/build/features/hooks:
- * "Only an explicit deny blocks"; exit 0 allows, exit 2 denies), and a hook
- * allow does not reach the human — it only declines to deny, after which
- * Grok's own gate auto-approves reads, searches and allow-listed shell
- * commands. An ACP `ask` therefore fails CLOSED in every permission mode:
- * deny, with the ACP reason and the console approval link. Never allow.
+ * ASK MAPPING (version gate): an ACP `ask` becomes Grok's own prompt only
+ * when `grok --version` reports 1.0.13 or newer, permissionMode is
+ * `default`, `plan` or `auto`, CI is unset, the tier is interactive and the
+ * process has a controlling terminal. The version is looked up once per
+ * binary path and modification time (cached in
+ * ~/.acp/hooks/grok-build/grok-version.json, 1.5 s limit); an unknown or
+ * older version is treated as unable to ask. In every other case — older or
+ * unknown Grok, `bypassPermissions` (auto-answers every prompt), `dontAsk`
+ * (never prompts), CI, no terminal — the ask fails CLOSED: deny, with the
+ * gateway reason unchanged. Never allow. The PreToolUse body tells the
+ * gateway which case applies (`attended`, `capabilities: ["native_ask"]`).
  *
  * Unreachability posture (gatewaystack-connect#385, never-brick): interactive
  * sessions fail OPEN with a loud UNGOVERNED warning and a ~/.acp/lapse.log
@@ -39,11 +46,15 @@
  * inability to ASK the policy.
  */
 
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs'
+import { execFile } from 'node:child_process'
+import {
+  accessSync, appendFileSync, closeSync, constants, mkdirSync, openSync, readFileSync, realpathSync,
+  statSync, writeFileSync, unlinkSync,
+} from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 
-export const HOOK_VERSION = '0.1.1'
+export const HOOK_VERSION = '0.2.0'
 
 /** 200 KB ceiling on tool output sent for post-hoc scanning (matches the backend). */
 const POST_HOOK_PAYLOAD_CEILING = 200 * 1024
@@ -111,15 +122,127 @@ function firstDeletedNoticeThisSession(sessionId, env = process.env) {
 const KEY_FIX = 'Fix: re-run the installer (curl -sf https://agenticcontrolplane.com/install.sh | bash) or create a key at https://cloud.agenticcontrolplane.com/settings/api-keys and save it: echo \'gsk_...\' > ~/.acp/credentials'
 const DELETED_FIX = 'The ACP workspace this machine was connected to has been deleted. To remove ACP from this machine: acp-uninstall (older installs without it: curl -sf https://agenticcontrolplane.com/uninstall.sh | bash). To keep using ACP, re-run the installer: curl -sf https://agenticcontrolplane.com/install.sh | bash'
 
-/** Modes where a human answers prompts. Everything else has an empty chair. */
-const ATTENDED_MODES = new Set(['default', 'plan'])
+/** Modes where a hook ask reaches a human. In `auto` the classifier answers
+ * Grok's own prompts, but a hook ask still prompts the person. Everything
+ * else has an empty chair. */
+const ATTENDED_MODES = new Set(['default', 'plan', 'auto'])
+
+/** First Grok Build release whose hooks can return "ask". */
+const NATIVE_ASK_MIN_VERSION = '1.0.13'
+
+/** Hard ceiling on the `grok --version` lookup. */
+const VERSION_TIMEOUT_MS = 1500
+
+/** Numeric per-part comparison of dotted versions; missing parts count as 0. */
+function versionAtLeast(version, min) {
+  if (typeof version !== 'string' || !/^\d+(\.\d+)*$/.test(version)) return false
+  const a = version.split('.').map(Number)
+  const b = min.split('.').map(Number)
+  for (let i = 0; i < Math.max(a.length, b.length); i++) {
+    const x = a[i] ?? 0
+    const y = b[i] ?? 0
+    if (x !== y) return x > y
+  }
+  return true
+}
+
+/** Resolve `grok` on PATH to its real path and modification time, or null. */
+function findGrokBinary(env) {
+  const names = process.platform === 'win32' ? ['grok.exe', 'grok.cmd', 'grok'] : ['grok']
+  for (const dir of String(env.PATH ?? env.Path ?? '').split(delimiter)) {
+    if (!dir) continue
+    for (const name of names) {
+      try {
+        const candidate = join(dir, name)
+        const st = statSync(candidate)
+        if (!st.isFile()) continue
+        if (process.platform !== 'win32') accessSync(candidate, constants.X_OK)
+        return { path: realpathSync(candidate), mtimeMs: st.mtimeMs }
+      } catch { /* absent or not executable — try the next one */ }
+    }
+  }
+  return null
+}
+
+function runGrokVersion(bin, { timeoutMs }) {
+  return new Promise((resolve, reject) => {
+    execFile(bin, ['--version'], { timeout: timeoutMs, killSignal: 'SIGKILL', windowsHide: true, encoding: 'utf8' },
+      (error, stdout) => (error ? reject(error) : resolve(stdout)))
+  })
+}
+
+/**
+ * The installed Grok Build version as a dotted string, or "unknown". Runs
+ * `grok --version` at most once per resolved binary path and modification
+ * time; the answer (including "unknown") is cached in
+ * ~/.acp/hooks/grok-build/grok-version.json. Never waits longer than
+ * VERSION_TIMEOUT_MS, whatever the runner does. Any failure is "unknown",
+ * which callers must treat as unable to ask.
+ */
+export async function lookupGrokVersion({ env = process.env, run = runGrokVersion } = {}) {
+  let bin
+  try { bin = findGrokBinary(env) } catch { bin = null }
+  if (!bin) return 'unknown'
+  const cacheDir = join(acpDir(env), 'hooks', 'grok-build')
+  const cacheFile = join(cacheDir, 'grok-version.json')
+  try {
+    const cached = JSON.parse(readFileSync(cacheFile, 'utf8'))
+    if (cached?.path === bin.path && cached?.mtimeMs === bin.mtimeMs && typeof cached.version === 'string') {
+      return cached.version
+    }
+  } catch { /* no cache yet, or unreadable — look it up */ }
+
+  let timer
+  const output = await Promise.race([
+    Promise.resolve().then(() => run(bin.path, { timeoutMs: VERSION_TIMEOUT_MS })),
+    new Promise((resolve) => { timer = setTimeout(resolve, VERSION_TIMEOUT_MS, null) }),
+  ]).catch(() => null).finally(() => clearTimeout(timer))
+  const match = /\d+(?:\.\d+)+/.exec(typeof output === 'string' ? output : '')
+  const version = match ? match[0] : 'unknown'
+  try {
+    mkdirSync(cacheDir, { recursive: true })
+    writeFileSync(cacheFile, JSON.stringify({ path: bin.path, mtimeMs: bin.mtimeMs, version }))
+  } catch { /* cache is best-effort */ }
+  return version
+}
+
+/** True when the process has a controlling terminal a person can answer at. */
+export function hasTerminal() {
+  try {
+    closeSync(openSync(process.platform === 'win32' ? 'CONIN$' : '/dev/tty', 'r'))
+    return true
+  } catch { return false }
+}
+
+/**
+ * Why a gateway ask cannot become Grok's own prompt here, or null when it
+ * can. Cheap checks first; the version and terminal lookups run only when
+ * everything else allows an ask. A lookup that throws counts as "cannot".
+ */
+async function cannotAskBecause(call, env, tier, deps) {
+  const mode = call.permissionMode
+  if (mode === 'bypassPermissions') return 'always-approve mode answers prompts by itself'
+  if (mode === 'dontAsk') return 'dontAsk mode never prompts'
+  if (!ATTENDED_MODES.has(mode)) return mode === undefined ? 'the permission mode is missing' : 'the permission mode is unknown'
+  if (env.CI) return 'CI is set'
+  if (tier !== 'interactive') return `the ${tier} tier has nobody at the prompt`
+  let version
+  try { version = await (deps.grokVersion ?? (() => lookupGrokVersion({ env })))() } catch { version = 'unknown' }
+  if (!versionAtLeast(version, NATIVE_ASK_MIN_VERSION)) {
+    return `this Grok version cannot show a hook prompt (needs ${NATIVE_ASK_MIN_VERSION} or newer)`
+  }
+  let terminal
+  try { terminal = await (deps.hasTerminal ?? hasTerminal)() } catch { terminal = false }
+  if (terminal !== true) return 'there is no terminal'
+  return null
+}
 
 /**
  * Tier resolution, in trust order: explicit env, config file, CI markers,
  * then the payload's own permissionMode — `bypassPermissions` and `dontAsk`
  * mean no human is answering prompts (fail-closed posture). `auto` keeps a
  * human at the terminal (the classifier only auto-answers), so it stays
- * interactive for the unreachability posture even though asks fail closed.
+ * interactive.
  */
 function resolveTier(env = process.env, config = {}, permissionMode) {
   if (env.ACP_AGENT_TIER) return env.ACP_AGENT_TIER
@@ -201,6 +324,19 @@ function encodeDeny(reason, event) {
   }
 }
 
+/** Grok's own confirmation prompt (Grok Build 1.0.13+), both channels. */
+function encodeAsk(reason, event) {
+  return {
+    decision: 'ask',
+    reason,
+    hookSpecificOutput: {
+      hookEventName: event,
+      permissionDecision: 'ask',
+      permissionDecisionReason: reason,
+    },
+  }
+}
+
 const ALLOW = { decision: 'allow' }
 
 /**
@@ -269,7 +405,12 @@ export function buildReceiptMessage(stats, sessionId, consoleBase = 'https://clo
   return `[ACP] Session receipt: ${parts.join(' · ')} — review this session: ${url}`
 }
 
-export async function decide(payload, env = process.env) {
+/**
+ * `deps` makes the environment probes injectable: `grokVersion()` returns
+ * the Grok version string (or "unknown") and `hasTerminal()` a boolean;
+ * either may be async. Both default to the real lookups.
+ */
+export async function decide(payload, env = process.env, deps = {}) {
   const call = normalize(payload, env)
   const config = readConfig(env)
   const tier = resolveTier(env, config, call.permissionMode)
@@ -344,17 +485,26 @@ export async function decide(payload, env = process.env) {
     return { out: {} }
   }
 
-  // PreToolUse resolves against the pre-call policy.
+  // PreToolUse resolves against the pre-call policy. `attended` tells the
+  // gateway whether an ask can reach a person here; a false claim always
+  // wins on the gateway side.
+  const cannotAsk = await cannotAskBecause(call, env, tier, deps)
+  const claim = cannotAsk === null
+  const attended = { claim, source: 'permission_mode' }
+  if (typeof call.permissionMode === 'string') attended.mode = call.permissionMode.slice(0, 32)
+  if (call.permissionMode === 'bypassPermissions') attended.auto_approve = true
+  const preBody = { ...base, attended, ...(claim ? { capabilities: ['native_ask'] } : {}) }
+
   let data
   try {
     try {
-      data = await post(govern, headers, '/govern/tool-use', base, timeoutMs)
+      data = await post(govern, headers, '/govern/tool-use', preBody, timeoutMs)
     } catch (first) {
       // Retry once before applying the fail posture (gatewaystack-connect#690):
       // slow answers are cold starts, so the retry lands on a warm instance.
       // Retry only a transport failure — an HTTP status is the server answering.
       if (first?.httpStatus !== undefined) throw first
-      data = await post(govern, headers, '/govern/tool-use', base, timeoutMs)
+      data = await post(govern, headers, '/govern/tool-use', preBody, timeoutMs)
     }
   } catch (error) {
     // A 401/403 is NOT the gateway being down — it is this machine's key being
@@ -403,24 +553,34 @@ export async function decide(payload, env = process.env) {
   }
   if (data.decision === 'ask') {
     bump(call.sessionId, 'asked')
-    // Grok has no ask decision and a hook "allow" only declines to deny: the
-    // call then falls through to Grok's own gate, which auto-approves reads,
-    // searches and allow-listed shell commands — so an allow here would turn
-    // a policy ask into a silent allow. Fail closed in every mode; the reason
-    // carries the ACP verdict and the place to approve it.
-    const where = ATTENDED_MODES.has(call.permissionMode)
-      ? 'Grok hooks cannot prompt, so the call is held'
-      : `nobody is at the prompt in ${call.permissionMode ?? 'this'} mode, so the call is held`
-    const reason = `[ACP] Approval required: ${data.reason ?? 'approval required'} — ${where}. Approve it: ${(env.ACP_CONSOLE_BASE ?? config.console_base ?? 'https://cloud.agenticcontrolplane.com')}/activity`
+    // The gateway reason is passed through untouched (never truncated,
+    // wrapped or escaped) — it may end with a console approval link.
+    const gatewayReason = typeof data.reason === 'string' && data.reason ? data.reason : 'approval required'
+    if (claim) {
+      // Grok shows its own prompt after the hook exits 0; the person decides.
+      const reason = gatewayReason.startsWith('ACP (Agentic Control Plane) asks: ') || gatewayReason.startsWith('[ACP]')
+        ? gatewayReason
+        : `[ACP] Approval required: ${gatewayReason}`
+      return { out: encodeAsk(reason, call.event) }
+    }
+    // Nobody can be asked (or an old Grok would read "ask" as fail-open):
+    // a hook "allow" would fall through to Grok's own gate, which
+    // auto-approves reads, searches and allow-listed commands — so fail
+    // closed.
+    const reason = `[ACP] This call needs a person's approval and Grok cannot ask here (${cannotAsk}), so it is blocked. Approve it in the ACP console, then run it again.\n\n${gatewayReason}`
     return { out: encodeDeny(reason, call.event), deny: true }
   }
   if (data.warning) return { out: ALLOW, warn: String(data.warning) }
   return { out: ALLOW }
 }
 
-export async function runHook(fallbackEvent) {
+/** `io` overrides the process streams, env and decide() deps (tests only). */
+export async function runHook(fallbackEvent, io = {}) {
+  const stdin = io.stdin ?? process.stdin
+  const stdout = io.stdout ?? process.stdout
+  const stderr = io.stderr ?? process.stderr
   let raw = ''
-  for await (const chunk of process.stdin) raw += chunk
+  for await (const chunk of stdin) raw += chunk
   let payload = {}
   try { payload = JSON.parse(raw) } catch { /* empty or non-JSON stdin — still answer */ }
   if (fallbackEvent && payload.hookEventName === undefined && payload.hook_event_name === undefined) {
@@ -429,7 +589,7 @@ export async function runHook(fallbackEvent) {
 
   let result
   try {
-    result = await decide(payload)
+    result = await decide(payload, io.env ?? process.env, io.deps ?? {})
   } catch (error) {
     // A hook crash must never take the harness down with it: fail open with
     // a loud trace rather than let an unhandled rejection decide anything.
@@ -437,12 +597,13 @@ export async function runHook(fallbackEvent) {
     result = { out: ALLOW, warn: `[ACP] hook error (${error?.message ?? 'unknown'}) — call proceeded WITHOUT policy check` }
   }
   // On deny, stderr's first line doubles as the reason for the exit-2 channel.
+  // An ask writes nothing there and exits 0: Grok shows its prompt afterwards.
   if (result.deny) {
-    process.stderr.write((result.out.reason ?? 'denied by ACP') + '\n')
+    stderr.write((result.out.reason ?? 'denied by ACP') + '\n')
   } else if (result.warn) {
-    process.stderr.write(result.warn + '\n')
+    stderr.write(result.warn + '\n')
   }
-  process.stdout.write(JSON.stringify(result.out) + '\n')
+  stdout.write(JSON.stringify(result.out) + '\n')
   // Exit 2 is Grok's alternate deny channel; the stdout deny is authoritative
   // either way, so this only hardens against stdout parse edge cases.
   if (result.deny) process.exitCode = 2

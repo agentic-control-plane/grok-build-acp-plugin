@@ -36,9 +36,18 @@ Credentials live at `~/.acp/credentials` (the installer provisions them; or past
 
 ## The ask decision
 
-Grok Build's hook contract has no `ask`. A gate hook can only deny or decline to deny ([docs](https://docs.x.ai/build/features/hooks): "Only an explicit `deny` blocks"; exit 0 allows, exit 2 denies). A hook allow does not reach the human: the call falls through to Grok's own permission gate, which auto-approves reads, searches and allow-listed shell commands. Letting an ACP `ask` through would therefore turn a policy ask into a silent allow.
+When ACP holds a call for approval, Grok shows its own confirmation prompt if it can. The prompt names the hook and shows the ACP reason. Answer yes and the call runs; answer no and it does not.
 
-So an ACP `ask` fails **closed in every permission mode** (`default`, `plan`, `auto`, `bypassPermissions`, headless): the call is denied with the ACP reason and the console link (`hook.mjs`, `data.decision === 'ask'`). Approve it on the dashboard and re-run, or set an allow rule for the tool.
+The prompt appears only when all of these are true:
+
+- Grok Build is version 1.0.13 or newer. The hook runs `grok --version` once per installed binary, waits at most 1.5 seconds, and caches the answer in `~/.acp/hooks/grok-build/grok-version.json`.
+- The permission mode is `default`, `plan` or `auto`. In `auto` mode the prompt still appears, even for commands you saved as "always allow".
+- `CI` is not set.
+- The hook has a terminal a person can answer at.
+
+In every other case the held call is blocked instead. That covers `--always-approve` (it would answer the prompt by itself), `dontAsk` mode (it never prompts), CI, runs without a terminal, and a Grok version that is older than 1.0.13 or cannot be read. Grok versions before 1.0.13 do not understand an ask and would run the call, so an unreadable version always counts as too old. The block message says why Grok cannot ask and ends with the ACP reason, including any approval link it carries. Approve the call in the ACP console and run it again, or set an allow rule for the tool.
+
+The hook tells the gateway which case applies on every pre-call check (`attended` and `capabilities: ["native_ask"]`), so the gateway knows whether a person can be asked.
 
 ## Failure posture
 

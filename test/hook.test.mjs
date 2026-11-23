@@ -31,6 +31,12 @@ before(async () => {
       }
       if (cmd.includes('rm -rf')) return res.end(JSON.stringify({ decision: 'deny', reason: 'hardline floor' }))
       if (cmd.includes('git push')) return res.end(JSON.stringify({ decision: 'ask', reason: 'outward-facing' }))
+      if (cmd.includes('git tag')) {
+        return res.end(JSON.stringify({
+          decision: 'ask',
+          reason: 'ACP (Agentic Control Plane) asks: tagging is outward-facing. Approve: https://cloud.agenticcontrolplane.com/approvals/apr_1',
+        }))
+      }
       if (cmd.includes('boom-500')) { res.statusCode = 500; return res.end('{}') }
       return res.end(JSON.stringify({ decision: 'allow' }))
     })
@@ -95,40 +101,68 @@ test('policy deny emits top-level decision:"deny" plus forward-compat hookSpecif
   assert.equal(out.hookSpecificOutput.permissionDecision, 'deny')
 })
 
-test('ask in default mode fails closed: deny with the ACP reason (never a silent allow)', async () => {
-  const { out, deny, warn } = await decide(grokPayload('git push origin main'), makeEnv())
+// Probes for a Grok that can show a hook prompt, with a person at the terminal.
+const CAN_ASK = { grokVersion: () => '1.0.13', hasTerminal: () => true }
+const NO_TERMINAL = { grokVersion: () => '1.0.13', hasTerminal: () => false }
+
+test('ask in default mode: Grok prompt when it can ask, deny with the ACP reason when it cannot (never a silent allow)', async () => {
+  const asked = await decide(grokPayload('git push origin main'), makeEnv(), CAN_ASK)
+  assert.equal(asked.deny, undefined)
+  assert.equal(asked.out.decision, 'ask')
+  assert.equal(asked.out.reason, '[ACP] Approval required: outward-facing')
+  assert.equal(asked.out.hookSpecificOutput.permissionDecision, 'ask')
+  assert.equal(asked.warn, undefined)
+
+  const { out, deny, warn } = await decide(grokPayload('git push origin main'), makeEnv(), NO_TERMINAL)
   assert.equal(deny, true)
   assert.equal(out.decision, 'deny')
-  assert.match(out.reason, /Approval required: outward-facing/)
-  assert.match(out.reason, /cloud\.agenticcontrolplane\.com/)
+  assert.match(out.reason, /outward-facing/)
+  assert.match(out.reason, /there is no terminal/)
   assert.equal(warn, undefined)
 })
 
-test('ask in plan mode also fails closed', async () => {
+test('ask in plan mode: Grok prompt when it can ask, deny when it cannot', async () => {
+  const asked = await decide(
+    grokPayload('git push origin main', { permissionMode: 'plan' }),
+    makeEnv(),
+    CAN_ASK,
+  )
+  assert.equal(asked.out.decision, 'ask')
+
   const { out, deny } = await decide(
     grokPayload('git push origin main', { permissionMode: 'plan' }),
     makeEnv(),
+    NO_TERMINAL,
   )
   assert.equal(deny, true)
   assert.equal(out.decision, 'deny')
-  assert.match(out.reason, /Approval required: outward-facing/)
+  assert.match(out.reason, /outward-facing/)
 })
 
-test('ask in bypassPermissions mode becomes a deny with the console link', async () => {
+test('ask in bypassPermissions mode becomes a deny carrying the gateway console link', async () => {
   const { out, deny } = await decide(
-    grokPayload('git push origin main', { permissionMode: 'bypassPermissions' }),
+    grokPayload('git tag v1', { permissionMode: 'bypassPermissions' }),
     makeEnv(),
+    CAN_ASK,
   )
   assert.equal(deny, true)
   assert.equal(out.decision, 'deny')
-  assert.match(out.reason, /nobody is at the prompt/)
+  assert.match(out.reason, /always-approve mode answers prompts by itself/)
   assert.match(out.reason, /cloud\.agenticcontrolplane\.com/)
 })
 
-test('ask in auto mode also fails closed (classifier answers prompts, not the human)', async () => {
+test('ask in auto mode: Grok prompt when it can ask (a hook ask still reaches the human), deny when it cannot', async () => {
+  const asked = await decide(
+    grokPayload('git push origin main', { permissionMode: 'auto' }),
+    makeEnv(),
+    CAN_ASK,
+  )
+  assert.equal(asked.out.decision, 'ask')
+
   const { out } = await decide(
     grokPayload('git push origin main', { permissionMode: 'auto' }),
     makeEnv(),
+    NO_TERMINAL,
   )
   assert.equal(out.decision, 'deny')
 })
