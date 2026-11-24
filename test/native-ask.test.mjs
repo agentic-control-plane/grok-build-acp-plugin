@@ -5,9 +5,9 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, utimesSync, existsSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, utimesSync, existsSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join, relative } from 'node:path'
 
 import { decide, runHook, lookupGrokVersion } from '../hook.mjs'
 
@@ -246,6 +246,24 @@ test('runHook: a held deny still exits 2', async () => {
   assert.notEqual(r.stderr, '')
 })
 
+test('runHook: the exit-2 stderr line carries the whole held-deny reason, link included', async () => {
+  const r = await runCli(pre('acp-ask'), makeEnv(), probes('1.0.12'))
+  const firstLine = r.stderr.split('\n')[0]
+  assert.match(firstLine, /Grok cannot ask here/)
+  assert.ok(firstLine.endsWith(ACP_ASK), 'gateway reason and its link are on the first stderr line')
+  // stdout keeps the reason exactly as decide() built it.
+  assert.ok(JSON.parse(r.stdout).reason.endsWith(`\n\n${ACP_ASK}`))
+})
+
+test('a held deny always names the console, even when the gateway reason has no link', async () => {
+  const { out } = await decide(pre('plain-ask'), makeEnv(), probes('1.0.12'))
+  assert.equal(out.decision, 'deny')
+  assert.ok(out.reason.includes('https://cloud.agenticcontrolplane.com/activity'))
+  assert.ok(out.reason.endsWith('\n\noutward-facing'))
+  const custom = await decide(pre('plain-ask'), makeEnv({ ACP_CONSOLE_BASE: 'https://console.example.test' }), probes('1.0.12'))
+  assert.ok(custom.out.reason.includes('https://console.example.test/activity'))
+})
+
 // --- Version lookup ------------------------------------------------------------
 
 function fakeGrok() {
@@ -287,6 +305,45 @@ test('version lookup: a failing runner yields unknown, and unknown is cached too
   assert.equal(await lookupGrokVersion({ env, run }), 'unknown')
   assert.equal(await lookupGrokVersion({ env, run }), 'unknown')
   assert.equal(calls, 1)
+})
+
+test('version lookup: an unknown answer is retried once the retry window has passed', async () => {
+  const { env, cache } = fakeGrok()
+  let calls = 0
+  const failing = () => { calls++; throw new Error('cold start') }
+  assert.equal(await lookupGrokVersion({ env, run: failing }), 'unknown')
+  assert.equal(calls, 1)
+  const cached = JSON.parse(readFileSync(cache, 'utf8'))
+  writeFileSync(cache, JSON.stringify({ ...cached, checkedAt: Date.now() - 11 * 60 * 1000 }))
+  assert.equal(await lookupGrokVersion({ env, run: () => { calls++; return 'grok 1.0.45' } }), '1.0.45')
+  assert.equal(calls, 2)
+})
+
+test('version lookup: a date-like number is not a Grok version', async () => {
+  const { env } = fakeGrok()
+  assert.equal(await lookupGrokVersion({ env, run: () => 'grok 2026.11.01 build' }), 'unknown')
+})
+
+test('version lookup asks the Grok that invoked the hook, not the one on PATH', async () => {
+  const { env } = fakeGrok()
+  const other = mkdtempSync(join(tmpdir(), 'grok-acp-invoking-'))
+  const invoking = join(other, 'grok')
+  writeFileSync(invoking, '#!/bin/sh\necho never-run\n', { mode: 0o755 })
+  const ran = []
+  const run = (bin) => { ran.push(bin); return bin === realpathSync(invoking) ? 'grok 1.0.12' : 'grok 1.0.45' }
+  const version = await lookupGrokVersion({ env, run, ancestors: () => ['/bin/sh', invoking] })
+  assert.deepEqual(ran, [realpathSync(invoking)])
+  assert.equal(version, '1.0.12')
+})
+
+test('version lookup skips relative PATH entries', async () => {
+  const { env } = fakeGrok()
+  let calls = 0
+  const rel = relative(process.cwd(), env.PATH)
+  assert.ok(!isAbsolute(rel))
+  const version = await lookupGrokVersion({ env: { ...env, PATH: rel }, run: () => { calls++; return '1.0.45' }, ancestors: () => [] })
+  assert.equal(version, 'unknown')
+  assert.equal(calls, 0)
 })
 
 test('version lookup: output without a dotted version yields unknown', async () => {
