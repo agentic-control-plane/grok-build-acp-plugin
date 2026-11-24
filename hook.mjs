@@ -31,8 +31,10 @@
  * when `grok --version` reports 1.0.13 or newer, permissionMode is
  * `default`, `plan` or `auto`, CI is unset, the tier is interactive and the
  * process has a controlling terminal. The binary asked is the Grok that
- * invoked the hook where the platform shows it (Linux), otherwise the first
- * `grok` on an absolute PATH entry. The version is looked up once per
+ * invoked the hook where the platform shows it (Linux; an unreadable one is
+ * "unknown", never a PATH fallback), otherwise the first `grok` on PATH
+ * outside the project, `node_modules` and relative entries. The version is
+ * looked up once per
  * binary path and modification time (cached in
  * ~/.acp/hooks/grok-build/grok-version.json, 1.5 s limit; an unknown answer
  * is retried after 10 minutes); an unknown or older version is treated as
@@ -49,13 +51,13 @@
  * inability to ASK the policy.
  */
 
-import { execFile } from 'node:child_process'
+import { spawn } from 'node:child_process'
 import {
-  accessSync, appendFileSync, closeSync, constants, mkdirSync, openSync, readFileSync, realpathSync,
-  renameSync, statSync, writeFileSync, unlinkSync,
+  accessSync, appendFileSync, closeSync, constants, mkdirSync, openSync, readFileSync, readlinkSync,
+  realpathSync, renameSync, statSync, writeFileSync, unlinkSync,
 } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, delimiter, isAbsolute, join } from 'node:path'
+import { basename, delimiter, isAbsolute, join, relative, resolve } from 'node:path'
 
 export const HOOK_VERSION = '0.2.0'
 
@@ -165,8 +167,10 @@ function executableAt(candidate) {
 const GROK_NAME = /^grok(\.exe|\.cmd)?$/i
 
 /**
- * Executable paths of this process's ancestors, nearest first, where the
- * platform exposes them (Linux /proc). Elsewhere, or on any error, empty.
+ * What this process's ancestors are running, nearest first, where the
+ * platform exposes it (Linux /proc): the executable link text (which may end
+ * in " (deleted)" after an update), or the bare process name when the link
+ * cannot be read. Elsewhere, or on any error, empty.
  */
 function ancestorExecutables() {
   if (process.platform !== 'linux') return []
@@ -174,7 +178,11 @@ function ancestorExecutables() {
   try {
     let pid = process.ppid
     for (let depth = 0; depth < 8 && pid > 1; depth++) {
-      try { found.push(realpathSync(`/proc/${pid}/exe`)) } catch { /* unreadable — keep walking */ }
+      try {
+        found.push(readlinkSync(`/proc/${pid}/exe`))
+      } catch {
+        try { found.push(readFileSync(`/proc/${pid}/comm`, 'utf8').trim()) } catch { /* nothing to name it by */ }
+      }
       const stat = readFileSync(`/proc/${pid}/stat`, 'utf8')
       pid = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1])
     }
@@ -182,24 +190,43 @@ function ancestorExecutables() {
   return found
 }
 
+/** True when `dir` is `root` or lies inside it (both compared as real paths). */
+function isInside(dir, root) {
+  if (typeof root !== 'string' || !root) return false
+  const real = (p) => { try { return realpathSync(p) } catch { return resolve(p) } }
+  const rel = relative(real(root), real(dir))
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+}
+
+/** Sentinel: a Grok invoked this hook but its binary cannot be read. */
+const UNREADABLE_GROK = Symbol('unreadable-grok')
+
 /**
- * The Grok binary to ask for its version: the Grok process that invoked this
- * hook when it can be identified, otherwise the first `grok` on an absolute
- * PATH entry. Relative PATH entries are skipped: they resolve against the
- * project directory, and a repository must not be able to plant a `grok`
- * that the hook runs.
+ * The Grok binary to ask for its version.
+ *
+ * - When an ancestor process is a Grok (Linux), that binary, and only that
+ *   one: if it cannot be read (deleted after an update, link unreadable)
+ *   the answer is UNREADABLE_GROK, never a fallback to PATH.
+ * - Otherwise the first `grok` on PATH, skipping entries a project can
+ *   control: relative entries, any `node_modules` directory, and anything
+ *   inside the project directory or the hook's working directory.
  */
-function findGrokBinary(env, ancestors) {
+function findGrokBinary(env, ancestors, roots) {
   let invoking = []
   try { invoking = ancestors() } catch { invoking = [] }
-  for (const exe of Array.isArray(invoking) ? invoking : []) {
-    if (typeof exe !== 'string' || !isAbsolute(exe) || !GROK_NAME.test(basename(exe))) continue
-    const bin = executableAt(exe)
-    if (bin) return bin
+  for (const entry of Array.isArray(invoking) ? invoking : []) {
+    if (typeof entry !== 'string') continue
+    const deleted = entry.endsWith(' (deleted)')
+    const exe = deleted ? entry.slice(0, -' (deleted)'.length) : entry
+    if (!GROK_NAME.test(basename(exe))) continue
+    if (deleted || !isAbsolute(exe)) return UNREADABLE_GROK
+    return executableAt(exe) ?? UNREADABLE_GROK
   }
   const names = process.platform === 'win32' ? ['grok.exe', 'grok.cmd', 'grok'] : ['grok']
   for (const dir of String(env.PATH ?? env.Path ?? '').split(delimiter)) {
     if (!dir || !isAbsolute(dir)) continue
+    if (dir.split(/[\\/]+/).includes('node_modules')) continue
+    if (roots.some((root) => isInside(dir, root))) continue
     for (const name of names) {
       const bin = executableAt(join(dir, name))
       if (bin) return bin
@@ -209,20 +236,53 @@ function findGrokBinary(env, ancestors) {
 }
 
 /**
- * The version in `grok --version` output, or "unknown". Takes the first
- * dotted number that stands on its own; a date-like number (major part of
- * 100 or more) is not a Grok version.
+ * The version in `grok --version` output, or "unknown". Only the first
+ * non-empty line counts, and it must be the version itself, optionally
+ * after the program name ("grok 1.0.13", "grok-build version 1.0.13 (abc)").
+ * A date-like number (major part of 100 or more) is not a Grok version.
  */
 function parseGrokVersion(output) {
-  const match = /(?<![\d.])\d+(?:\.\d+)+(?![\d.])/.exec(typeof output === 'string' ? output : '')
-  if (!match || Number(match[0].split('.')[0]) >= 100) return 'unknown'
-  return match[0]
+  const line = (typeof output === 'string' ? output : '').split(/\r?\n/).map((l) => l.trim()).find(Boolean) ?? ''
+  const match = /^(?:grok(?:[ -]build)?\s+)?(?:version\s+)?v?(\d+(?:\.\d+)+)(?:\s+\(.*\))?$/i.exec(line)
+  if (!match || Number(match[1].split('.')[0]) >= 100) return 'unknown'
+  return match[1]
 }
 
+/**
+ * Run `grok --version`. Only stdout is piped; on timeout, error or exit the
+ * child is killed and its stdout destroyed, so a grandchild that keeps the
+ * pipe open cannot keep this process alive.
+ */
 function runGrokVersion(bin, { timeoutMs }) {
-  return new Promise((resolve, reject) => {
-    execFile(bin, ['--version'], { timeout: timeoutMs, killSignal: 'SIGKILL', windowsHide: true, encoding: 'utf8' },
-      (error, stdout) => (error ? reject(error) : resolve(stdout)))
+  return new Promise((resolveRun, reject) => {
+    let child
+    try {
+      child = spawn(bin, ['--version'], { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true })
+    } catch (error) { reject(error); return }
+    let out = ''
+    let done = false
+    let grace
+    const finish = (error) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      clearTimeout(grace)
+      try { child.stdout?.destroy() } catch { /* already closed */ }
+      try { child.kill('SIGKILL') } catch { /* already gone */ }
+      try { child.unref() } catch { /* nothing to unref */ }
+      if (error) reject(error)
+      else resolveRun(out)
+    }
+    const timer = setTimeout(() => finish(new Error('grok --version timed out')), timeoutMs)
+    child.stdout.setEncoding('utf8')
+    child.stdout.on('data', (chunk) => { if (out.length < 4096) out += chunk })
+    child.on('error', finish)
+    child.on('close', (code) => finish(code === 0 ? undefined : new Error(`grok --version exited ${code}`)))
+    child.on('exit', (code) => {
+      if (code !== 0) { finish(new Error(`grok --version exited ${code}`)); return }
+      // Let buffered output arrive, but do not wait on a pipe someone else holds.
+      grace = setTimeout(() => finish(), 200)
+    })
   })
 }
 
@@ -235,10 +295,14 @@ function runGrokVersion(bin, { timeoutMs }) {
  * than VERSION_TIMEOUT_MS, whatever the runner does. Any failure is
  * "unknown", which callers must treat as unable to ask.
  */
-export async function lookupGrokVersion({ env = process.env, run = runGrokVersion, ancestors = ancestorExecutables } = {}) {
+export async function lookupGrokVersion({
+  env = process.env, run = runGrokVersion, ancestors = ancestorExecutables, cwd,
+} = {}) {
   let bin
-  try { bin = findGrokBinary(env, ancestors) } catch { bin = null }
-  if (!bin) return 'unknown'
+  try {
+    bin = findGrokBinary(env, ancestors, [cwd, env.GROK_WORKSPACE_ROOT, process.cwd()])
+  } catch { bin = null }
+  if (!bin || bin === UNREADABLE_GROK) return 'unknown'
   const cacheDir = join(acpDir(env), 'hooks', 'grok-build')
   const cacheFile = join(cacheDir, 'grok-version.json')
   try {
@@ -288,7 +352,9 @@ async function cannotAskBecause(call, env, tier, deps) {
   if (env.CI) return 'CI is set'
   if (tier !== 'interactive') return `the ${tier} tier has nobody at the prompt`
   let version
-  try { version = await (deps.grokVersion ?? (() => lookupGrokVersion({ env })))() } catch { version = 'unknown' }
+  try {
+    version = await (deps.grokVersion ?? (() => lookupGrokVersion({ env, cwd: call.cwd })))()
+  } catch { version = 'unknown' }
   if (!versionAtLeast(version, NATIVE_ASK_MIN_VERSION)) {
     return `this Grok version cannot show a hook prompt (needs ${NATIVE_ASK_MIN_VERSION} or newer)`
   }
@@ -628,7 +694,7 @@ export async function decide(payload, env = process.env, deps = {}) {
     // a hook "allow" would fall through to Grok's own gate, which
     // auto-approves reads, searches and allow-listed commands — so fail
     // closed.
-    const consoleBase = env.ACP_CONSOLE_BASE ?? config.console_base ?? 'https://cloud.agenticcontrolplane.com'
+    const consoleBase = env.ACP_CONSOLE_BASE || config.console_base || 'https://cloud.agenticcontrolplane.com'
     const reason = `[ACP] This call needs a person's approval and Grok cannot ask here (${cannotAsk}), so it is blocked. Approve it in the ACP console (${consoleBase}/activity), then run it again.\n\n${gatewayReason}`
     return { out: encodeDeny(reason, call.event), deny: true }
   }
@@ -673,6 +739,14 @@ export async function runHook(fallbackEvent, io = {}) {
 }
 
 // Only run the CLI when invoked directly — tests import decide() without I/O.
+// Once the decision is flushed, exit: nothing left behind (such as a stray
+// `grok --version` grandchild) may keep the hook alive. A rejected runHook
+// still exits non-zero, as an unhandled crash did before.
 if (import.meta.url === `file://${process.argv[1]}`) {
   runHook()
+    .catch((error) => {
+      process.stderr.write(`[ACP] hook crashed: ${error?.message ?? error}\n`)
+      if (!process.exitCode) process.exitCode = 1
+    })
+    .finally(() => process.stdout.write('', () => process.exit()))
 }

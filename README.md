@@ -40,13 +40,15 @@ When ACP holds a call for approval, Grok shows its own confirmation prompt if it
 
 The prompt appears only when all of these are true:
 
-- Grok Build is version 1.0.13 or newer. The hook runs `grok --version` once per installed binary, waits at most 1.5 seconds, and caches the answer in `~/.acp/hooks/grok-build/grok-version.json`. If the version cannot be read, the hook tries again after 10 minutes. On Linux the hook checks the Grok that started it. On other systems it checks the first `grok` in a full path on `PATH`, so keep only one Grok installed there. An older Grok started by another path would run a held call without asking.
+- Grok Build is version 1.0.13 or newer. The hook runs `grok --version` once per installed binary, waits at most 1.5 seconds, and caches the answer in `~/.acp/hooks/grok-build/grok-version.json`. If the version cannot be read, the hook tries again after 10 minutes.
+  - On Linux, when a parent process of the hook is named `grok`, the hook checks that binary and no other. If that binary cannot be read, for example because an update replaced it while Grok was running, the call is blocked.
+  - Otherwise, including on macOS and Windows, the hook checks the first `grok` on `PATH`. It skips relative entries, `node_modules` folders and folders inside the project, so a repository cannot supply its own `grok`. Keep only one Grok installed. An older Grok started from another path would run a held call without asking.
 - The permission mode is `default`, `plan` or `auto`. In `auto` mode the prompt still appears, even for commands you saved as "always allow".
 - `CI` is not set.
 - The agent tier is interactive. Setting `ACP_AGENT_TIER` or `agent_tier` in `~/.acp/config.json` to anything else blocks the call instead.
 - The hook has a terminal a person can answer at.
 
-In every other case the held call is blocked instead. That covers `--always-approve` (it would answer the prompt by itself), `dontAsk` mode (it never prompts), CI, runs without a terminal, and a Grok version that is older than 1.0.13 or cannot be read. Grok versions before 1.0.13 do not understand an ask and would run the call, so an unreadable version always counts as too old. The block message says why Grok cannot ask and ends with the ACP reason, including any approval link it carries. Approve the call in the ACP console and run it again, or set an allow rule for the tool.
+In every other case the held call is blocked instead. That covers `--always-approve` (it would answer the prompt by itself), `dontAsk` mode (it never prompts), CI, runs without a terminal, and a Grok version that is older than 1.0.13 or cannot be read. Grok versions before 1.0.13 do not understand an ask and would run the call, so an unreadable version always counts as too old. What Grok 1.0.13 or newer does with an ask in a headless run (`grok -p` started from a terminal) has not been verified yet, so pin unattended runs to the background tier (`ACP_AGENT_TIER=background`), which always blocks a held call. The block message says why Grok cannot ask and ends with the ACP reason, including any approval link it carries. Approve the call in the ACP console and run it again, or set an allow rule for the tool.
 
 The hook tells the gateway which case applies on every pre-call check (`attended` and `capabilities: ["native_ask"]`), so the gateway knows whether a person can be asked.
 

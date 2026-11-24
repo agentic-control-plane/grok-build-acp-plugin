@@ -5,6 +5,8 @@
 import { test, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 import { createServer } from 'node:http'
+import { spawn } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, utimesSync, existsSync, realpathSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { isAbsolute, join, relative } from 'node:path'
@@ -334,6 +336,79 @@ test('version lookup asks the Grok that invoked the hook, not the one on PATH', 
   const version = await lookupGrokVersion({ env, run, ancestors: () => ['/bin/sh', invoking] })
   assert.deepEqual(ran, [realpathSync(invoking)])
   assert.equal(version, '1.0.12')
+})
+
+test('version lookup: an invoking Grok that cannot be read is unknown, never a PATH fallback', async () => {
+  const { env } = fakeGrok()
+  const gone = join(mkdtempSync(join(tmpdir(), 'grok-acp-gone-')), 'grok')
+  for (const ancestors of [() => [`${gone} (deleted)`], () => [gone], () => ['/bin/sh', 'grok']]) {
+    let calls = 0
+    const version = await lookupGrokVersion({ env, run: () => { calls++; return 'grok 1.0.45' }, ancestors })
+    assert.equal(version, 'unknown')
+    assert.equal(calls, 0, 'the PATH grok must not be asked instead')
+  }
+})
+
+test('version lookup skips PATH entries inside the project or node_modules', async () => {
+  const home = mkdtempSync(join(tmpdir(), 'grok-acp-proj-home-'))
+  const project = mkdtempSync(join(tmpdir(), 'grok-acp-proj-'))
+  const npmBin = join(project, 'node_modules', '.bin')
+  const projBin = join(project, 'tools')
+  const elsewhereNpm = join(mkdtempSync(join(tmpdir(), 'grok-acp-npm-')), 'node_modules', '.bin')
+  for (const dir of [npmBin, projBin, elsewhereNpm]) {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(join(dir, 'grok'), '#!/bin/sh\necho grok 9.9.9\n', { mode: 0o755 })
+  }
+  for (const dir of [npmBin, projBin, elsewhereNpm]) {
+    let calls = 0
+    const version = await lookupGrokVersion({
+      env: { HOME: home, PATH: dir }, cwd: project, ancestors: () => [], run: () => { calls++; return 'grok 9.9.9' },
+    })
+    assert.equal(version, 'unknown', `${dir} must be skipped`)
+    assert.equal(calls, 0, `planted grok in ${dir} must not run`)
+  }
+})
+
+test('version lookup parses only a whole version line', async () => {
+  const cases = {
+    'grok 1.0.45\n': '1.0.45',
+    '1.0.13': '1.0.13',
+    'grok-build version 1.0.20 (abc123)\n': '1.0.20',
+    'Update available: 1.0.14\n': 'unknown',
+    'grok (dev build)\nUpdate available: 1.0.14\n': 'unknown',
+    '\n\nerror: config 1.0.99 not found\n': 'unknown',
+  }
+  for (const [output, expected] of Object.entries(cases)) {
+    const { env } = fakeGrok()
+    assert.equal(await lookupGrokVersion({ env, run: () => output, ancestors: () => [] }), expected, JSON.stringify(output))
+  }
+})
+
+test('an empty ACP_CONSOLE_BASE falls back to the default console', async () => {
+  const { out } = await decide(pre('plain-ask'), makeEnv({ ACP_CONSOLE_BASE: '' }), probes('1.0.12'))
+  assert.ok(out.reason.includes('(https://cloud.agenticcontrolplane.com/activity)'))
+})
+
+test('a grok --version whose grandchild holds stdout cannot keep the hook alive', { skip: process.platform === 'win32' }, async () => {
+  const bin = mkdtempSync(join(tmpdir(), 'grok-acp-hang-bin-'))
+  writeFileSync(join(bin, 'grok'), '#!/bin/sh\n/bin/sleep 10 &\n/bin/sleep 10\n', { mode: 0o755 })
+  const work = mkdtempSync(join(tmpdir(), 'grok-acp-hang-cwd-'))
+  const env = { ...makeEnv(), PATH: bin }
+  const hook = fileURLToPath(new URL('../hook.mjs', import.meta.url))
+  const started = Date.now()
+  const child = spawn(process.execPath, [hook], { cwd: work, env, stdio: ['pipe', 'pipe', 'pipe'] })
+  let stdout = ''
+  child.stdout.on('data', (c) => { stdout += c })
+  child.stdin.end(JSON.stringify(pre('acp-ask', { cwd: work })))
+  const code = await new Promise((done) => {
+    const kill = setTimeout(() => { child.kill('SIGKILL'); done('killed') }, 8000)
+    child.on('exit', (c) => { clearTimeout(kill); done(c) })
+  })
+  const took = Date.now() - started
+  assert.notEqual(code, 'killed', 'hook was still running after 8 s')
+  assert.ok(took < 5000, `hook took ${took} ms to exit`)
+  assert.equal(code, 2)
+  assert.equal(JSON.parse(stdout).decision, 'deny')
 })
 
 test('version lookup skips relative PATH entries', async () => {
