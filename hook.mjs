@@ -39,11 +39,12 @@
  * inability to ASK the policy.
  */
 
-import { appendFileSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs'
+import { appendFileSync, mkdirSync, readFileSync, realpathSync, writeFileSync, unlinkSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
-export const HOOK_VERSION = '0.1.1'
+export const HOOK_VERSION = '0.1.2'
 
 /** 200 KB ceiling on tool output sent for post-hoc scanning (matches the backend). */
 const POST_HOOK_PAYLOAD_CEILING = 200 * 1024
@@ -449,6 +450,19 @@ export async function runHook(fallbackEvent) {
 }
 
 // Only run the CLI when invoked directly — tests import decide() without I/O.
-if (import.meta.url === `file://${process.argv[1]}`) {
+// Compare real paths, not a hand-built URL: a path with spaces, a symlink or a
+// Windows path never matched `file://${argv[1]}`, and a hook that silently
+// exits 0 is an allow.
+function isEntryPoint() {
+  const script = process.argv[1]
+  if (!script) return false
+  try {
+    return realpathSync(script) === realpathSync(fileURLToPath(import.meta.url))
+  } catch {
+    try { return pathToFileURL(script).href === import.meta.url } catch { return false }
+  }
+}
+
+if (isEntryPoint()) {
   runHook()
 }
